@@ -293,21 +293,168 @@ bool validateProgram(const char *sourcePath)
 }
 
 // PASS 0x1: RESOLVE() -> resolve.bin
-int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
+int64_t writeResolveRecord(FILE *f,int64_t offsetField,const string &text)
 {
-    // writes one [offset(8B)][size(4B)][string] record at the current file position
-    // returns this record's own starting byte position
+    int64_t pos=ftell(f);
+    int32_t size=text.size();
+    fwrite(&offsetField,8,1,f);
+    fwrite(&size,4,1,f);
+    fwrite(text.c_str(),1,size,f);
+    return pos;
 }
-int64_t readResolveRecord(FILE *f, string &outText)
+
+int64_t readResolveRecord(FILE *f,string &outText)
 {
-    // reads one record at the current position and advances past it, returns the offset field - the raw line text comes back untouched in outText.
+    int64_t sz;
+    int32_t size;
+
+    sz=ftell(f);
+
+    if(fread(&size,4,1,f)!=1)
+        return -1;
+
+    if(size<0||size>100000)
+        return -1;
+
+    outText.resize(size);
+
+    if(size>0&&fread(&outText[0],1,size,f)!=(size_t)size)
+        return -1;
+
+    return sz;
 }
-int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
+
+int64_t resolveProgram(const char *sourcePath,const char *resolveBinPath)
 {
     FuncEntry funcArray[MAX_FUNCS];
-    int32_t funcCount = 0;
+    int32_t funcCount=0;
+
     PendingPatch patches[MAX_PATCHES];
-    int32_t patchCount = 0;
+    int32_t patchCount=0;
+
+    ifstream in(sourcePath);
+
+    if(!in)
+    {
+        cout<<"error: cannot open source file!"<<endl;
+        return -1;
+    }
+    FILE *f=fopen(resolveBinPath,"wb+");
+    if(!f)
+    {
+        cout<<"error: cannot create resolve.bin"<<endl;
+        return -1;
+    }
+    string line;
+    bool ok=true;
+
+    while(ok&&readSourceLine(in,line))
+    {
+        string w=firstWord(line);
+
+        int64_t field=ftell(f);
+
+        if(w=="call")
+            field=0;
+
+        int64_t pos=writeResolveRecord(f,field,line);
+
+        if(w=="func")
+        {
+            string functionName=secondWord(line);
+
+            if(funcCount>=MAX_FUNCS)
+            {
+                cout<<"too many functions"<<endl;
+                ok=false;
+                break;
+            }
+
+            bool alreadyExists=false;
+
+            for(int32_t i=0;i<funcCount;i++)
+            {
+                if(funcArray[i].funcName==functionName)
+                {
+                    alreadyExists=true;
+                    break;
+                }
+            }
+
+            if(alreadyExists)
+            {
+                cout<<"duplicate function "<<functionName<<endl;
+                ok=false;
+                break;
+            }
+
+            funcArray[funcCount].funcName=functionName;
+            funcArray[funcCount].byteOffsetInResolveBin=pos;
+            funcCount++;
+        }
+        else if(w=="call")
+        {
+            if(patchCount>=MAX_PATCHES)
+            {
+                cout<<"too many calls"<<endl;
+                ok=false;
+                break;
+            }
+
+            patches[patchCount].byteOffsetOfOffsetField=pos;
+            patches[patchCount].targetFuncName=secondWord(line);
+            patchCount++;
+        }
+    }
+    in.close();
+    int64_t mainOffset=-1;
+    if(ok)
+    {
+        for(int32_t i=0;i<patchCount;i++)
+        {
+            string targetFunctionName=patches[i].targetFuncName;
+            int64_t targetOffset=-1;
+
+            for(int32_t j=0;j<funcCount;j++)
+            {
+                if(funcArray[j].funcName==targetFunctionName)
+                {
+                    targetOffset=funcArray[j].byteOffsetInResolveBin;
+                    break;
+                }
+            }
+
+            if(targetOffset==-1)
+            {
+                cout<<"call to undefined function "<<targetFunctionName<<endl;
+                ok=false;
+                break;
+            }
+
+            fseek(f,patches[i].byteOffsetOfOffsetField,SEEK_SET);
+            fwrite(&targetOffset,8,1,f);
+        }
+    }
+    if(ok)
+    {
+        for(int32_t i=0;i<funcCount;i++)
+        {
+            if(funcArray[i].funcName=="main")
+            {
+                mainOffset=funcArray[i].byteOffsetInResolveBin;
+                break;
+            }
+        }
+
+        if(mainOffset==-1)
+            cout<<"main function not found"<<endl;
+    }
+
+    fclose(f);
+
+    return mainOffset;
+}
+
     // Every source line becomes one record holding the raw line, as-is.
     // resolve() only PEEKS at the leading word(s) -- enough to spot FUNC
     // (remember its position) and CALL (remember which function it needs
@@ -316,7 +463,6 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
     // with its target's position. Patching happens after the full write
     // Returns the byte offset of main's FUNC header record.
     // if there is no main return the error 
-}
 
 // PASS 0x2: EXECUTION (tokenization happens here)
 enum TokenType

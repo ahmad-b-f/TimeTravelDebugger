@@ -1,0 +1,6 @@
+*.exe
+*.out
+*.o
+resolve.bin
+session.tdbg
+.vscode/

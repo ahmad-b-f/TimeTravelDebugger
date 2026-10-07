@@ -124,38 +124,45 @@ class Timeline
 {
     TimelineNode *head, *tail;
     int32_t stepCount;
-
+ 
 public:
-    // Implement these functions
     Timeline()
     {
+        head = nullptr;
+        tail = nullptr;
+        stepCount = 0;
+    }
+    ~Timeline()
+    {
+        while (head)
+        {
+            TimelineNode *t = head;
+            head = head->next;
+            delete t->data;
+            delete t;
+        }
     }
     void record(Snapshot *s)
     {
-        // add record in the timeline
+        TimelineNode *n = new TimelineNode;
+        n->data = s;
+        n->next = nullptr;
+        n->prev = tail;
+        if (tail)
+            tail->next = n;
+        else
+            head = n;
+        tail = n;
+        stepCount++;
     }
     TimelineNode *begin()
     {
+        return head;
     }
     int32_t getStepCount()
     {
+        return stepCount;
     }
-};
-
-// Core structs
-struct Variable
-{
-    string name;
-    int32_t value;
-};
-struct Frame
-{
-    string func_name;
-    int32_t argc;
-    Variable argv[MAX_VARS_PER_FRAME];
-    int32_t returnLine;
-    Variable locals[MAX_VARS_PER_FRAME];
-    int32_t localCount;
 };
 struct Snapshot
 {
@@ -478,23 +485,236 @@ struct Token
 };
 int32_t tokenizeLine(const string &line, Token tokens[], int32_t maxTokens)
 {
-    // first word is always a instruction keyword
-    // instruction set = [func, func_end, call, set, add, sub, mul and div]
-    // next word is identifier like name of a function, variable name
-    // after identifier all are the params/arg, space separated
+    int32_t n = 0, i = 0, len = line.size();
+    while (i < len && n < maxTokens)
+    {
+        while (i < len && isspace((unsigned char)line[i]))
+        {
+            i++;
+        }
+        if (i >= len)
+            break;
+        int32_t j = i;
+        while (j < len && !isspace((unsigned char)line[j]))
+        {
+            j++;
+        }
+        tokens[n].text = line.substr(i, j - i);
+        tokens[n].type = n == 0 ? KEYWORD : (n == 1 ? IDENTIFIER : PARAM);
+        n++;
+        i = j;
+    }
+    return n;
 }
 Snapshot *buildSnapshot(Stack<Frame> &callStack)
 {
-    // build the snapshot based on the callStack given
+    
+    Snapshot *s = new Snapshot;
+    memset(s, 0, sizeof(Snapshot));
+    s->stackDepth = callStack.snapshot_into(s->callStack, MAX_STACK_DEPTH);
+}
+void cpy(char *d, const string &s)
+{
+    strncpy(d, s.c_str(), 31);
+    d[31] = 0;
+}
+Variable *findvar(Frame &fr, const string &name)
+{
+    for (int32_t i = 0; i < fr.argc; i++)
+    {
+        if (strcmp(fr.argv[i].name, name.c_str()) == 0)
+            return &fr.argv[i];
+    }
+    for (int32_t i = 0; i < fr.localCount; i++)
+    {
+        if (strcmp(fr.locals[i].name, name.c_str()) == 0)
+            return &fr.locals[i];
+    }
+    return nullptr;
+}
+bool getval(Frame &fr, const string &s, int32_t &v)
+{
+    if ((s[0] >= '0' && s[0] <= '9') || (s[0] == '-' && s.size() > 1))
+    {
+        v = atoi(s.c_str());
+        return true;
+    }
+    Variable *p = findvar(fr, s);
+    if (!p)
+        return false;
+    v = p->value;
+    return true;
 }
 void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &timeline)
 {
-    // initialize the call stack
-    // make the main frame
-    // push main frame on the call stack
-
-    // implementation:
-    // execute line by line, and according to the keyword perform action
+    FILE *f = fopen(resolveBinPath, "rb");
+    if (!f)
+    {
+        cout << "error: cannot open resolve.bin" << endl;
+        return false;
+    }
+    Stack<Frame> callStack;
+    static char ca[MAX_STACK_DEPTH][MAX_VARS_PER_FRAME][32];
+    Token tk[MAX_TOKENS], ht[MAX_TOKENS];
+    string line, hs;
+    int64_t field, hf;
+ 
+    fseek(f, mainOffset, SEEK_SET);
+    if (readResolveRecord(f, field, line) < 0)
+    {
+        cout << "error: cannot read main" << endl;
+        fclose(f);
+        return false;
+    }
+    tokenizeLine(line, tk, MAX_TOKENS);
+    Frame mf;
+    memset(&mf, 0, sizeof(Frame));
+    cpy(mf.func_name, tk[1].text);
+    mf.returnLine = -1;
+    callStack.push(mf);
+    int64_t pc = ftell(f);
+    bool ok = true;
+ 
+    while (ok && !callStack.isEmpty())
+    {
+        fseek(f, pc, SEEK_SET);
+        int64_t at = readResolveRecord(f, field, line);
+        if (at < 0)
+        {
+            cout << "error: ran past end of resolve.bin" << endl;
+            ok = false;
+            break;
+        }
+        int64_t nx = ftell(f);
+        int32_t n = tokenizeLine(line, tk, MAX_TOKENS);
+        Frame &cur = callStack.peek();
+        const string &k = tk[0].text;
+        const char *er = nullptr;
+ 
+        if (k == "set")
+        {
+            int32_t v;
+            if (n < 3 || !getval(cur, tk[2].text, v))
+                er = "bad set";
+            else
+            {
+                Variable *p = findvar(cur, tk[1].text);
+                if (!p)
+                {
+                    if (cur.localCount >= MAX_VARS_PER_FRAME)
+                        er = "too many variables";
+                    else
+                    {
+                        p = &cur.locals[cur.localCount++];
+                        cpy(p->name, tk[1].text);
+                    }
+                }
+                if (p)
+                    p->value = v;
+            }
+            pc = nx;
+        }
+        else if (k == "add" || k == "sub" || k == "mul" || k == "div")
+        {
+            int32_t a;
+            Variable *p = n < 3 ? nullptr : findvar(cur, tk[1].text);
+            if (!p || !getval(cur, tk[2].text, a))
+                er = "bad arithmetic";
+            else if (k == "div" && a == 0)
+                er = "division by zero";
+            else
+            {
+                switch (k[0])
+                {
+                case 'a':
+                    p->value += a;
+                    break;
+                case 's':
+                    p->value -= a;
+                    break;
+                case 'm':
+                    p->value *= a;
+                    break;
+                case 'd':
+                    p->value /= a;
+                    break;
+                }
+            }
+            pc = nx;
+        }
+        else if (k == "call")
+        {
+            int32_t ac = n - 2;
+            int32_t hn = 0;
+            int64_t after = -1;
+            fseek(f, field, SEEK_SET);
+            if (readResolveRecord(f, hf, hs) >= 0)
+            {
+                after = ftell(f);
+                hn = tokenizeLine(hs, ht, MAX_TOKENS);
+            }
+            if (hn < 2 || ht[0].text != "func")
+                er = "bad call target";
+            else if (hn - 2 != ac)
+                er = "argument count mismatch";
+            else
+            {
+                int32_t d = callStack.depth();
+                Frame nf;
+                memset(&nf, 0, sizeof(Frame));
+                cpy(nf.func_name, ht[1].text);
+                nf.argc = ac;
+                nf.returnLine = (int32_t)nx;
+                for (int32_t i = 0; i < ac; i++)
+                {
+                    int32_t v;
+                    if (!getval(cur, tk[2 + i].text, v))
+                    {
+                        er = "undefined argument";
+                        break;
+                    }
+                    cpy(nf.argv[i].name, ht[2 + i].text);
+                    nf.argv[i].value = v;
+                    cpy(ca[d][i], tk[2 + i].text);
+                }
+                if (!er)
+                {
+                    if (!callStack.push(nf))
+                        er = "stack overflow";
+                    else
+                        pc = after;
+                }
+            }
+        }
+        else if (k == "func_end")
+        {
+            int32_t d = callStack.depth() - 1;
+            Frame done = callStack.pop();
+            if (!callStack.isEmpty())
+            {
+                Frame &cl = callStack.peek();
+                for (int32_t i = 0; i < done.argc; i++)
+                {
+                    Variable *p = findvar(cl, ca[d][i]);
+                    if (p)
+                        p->value = done.argv[i].value;
+                }
+            }
+            pc = done.returnLine;
+        }
+        else
+            er = "unknown instruction";
+ 
+        if (er)
+        {
+            cout << "error: " << er << " at offset " << at << endl;
+            ok = false;
+            break;
+        }
+        timeline.record(buildSnapshot(callStack));
+    }
+    fclose(f);
+    return ok;
 }
 
 // PASS 0x3: SERIALIZE TIMELINE
